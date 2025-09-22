@@ -1,0 +1,25 @@
+# ---------------------------------
+# .gitignore 예시
+# ---------------------------------
+
+# YAML 파일 무시
+# google-ads.yaml 등 모든 yaml 파일을 무시합니다.
+*.yaml
+*.yml
+
+# .env 파일 무시
+# .env, .env.local, .env.production 등 모든 환경 변수 파일을 무시합니다.
+.env
+*.env
+.env.*
+
+# (선택 사항) VSCode 설정 파일
+.vscode/
+
+# (선택 사항) Python 가상 환경
+venv/
+.venv/
+
+# (선택 사항) Python 캐시
+__pycache__/
+*.pyc

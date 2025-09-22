@@ -1,3 +1,4 @@
+import os
 import boto3
 from botocore.exceptions import ClientError
 from email.mime.multipart import MIMEMultipart
@@ -11,9 +12,9 @@ def send_report_email(sender, recipient, subject, body_text, file_path, aws_regi
     client = boto3.client('ses', region_name=aws_region)
     
     msg = MIMEMultipart()
-    msg = subject
+    msg['Subject'] = subject
     msg['From'] = sender
-    msg = recipient
+    msg['To'] = recipient
     
     # 이메일 본문
     msg.attach(MIMEText(body_text))
@@ -21,7 +22,7 @@ def send_report_email(sender, recipient, subject, body_text, file_path, aws_regi
     # 파일 첨부
     with open(file_path, 'rb') as f:
         part = MIMEApplication(f.read(), Name=os.path.basename(file_path))
-    part = f'attachment; filename="{os.path.basename(file_path)}"'
+    part['Content-Disposition'] = f'attachment; filename="{os.path.basename(file_path)}"'
     msg.attach(part)
     
     try:
