@@ -2,10 +2,10 @@ import sys
 from datetime import datetime, timedelta
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
-
+import yaml
 # 데이터를 조회할 대상 고객 ID (하이픈 '-' 제외)
 # 이 ID가 google-ads.yaml의 login_customer_id와 다를 수 있습니다. (예: MCC로 하위 계정 조회)
-CUSTOMER_ID = ""
+CUSTOMER_ID = "customer_id"
 
 def main(client, customer_id):
     """
@@ -69,6 +69,12 @@ if __name__ == "__main__":
         # google-ads.yaml 파일에서 인증 정보를 로드합니다.
         # 현재 스크립트와 같은 디렉터리의 google-ads.yaml 파일을 사용합니다.
         googleads_client = GoogleAdsClient.load_from_storage(path="./google-ads.yaml")
+
+        with open("google-ads.yaml", "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        CUSTOMER_ID = config["customer_id"]
+
 
         main(googleads_client, CUSTOMER_ID)
 
