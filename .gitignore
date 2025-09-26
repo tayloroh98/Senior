@@ -13,6 +13,10 @@
 *.env
 .env.*
 
+# Google API 인증 파일들 무시
+credentials.json
+token.json
+
 # (선택 사항) VSCode 설정 파일
 .vscode/
 
