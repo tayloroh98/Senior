@@ -1,15 +1,15 @@
+import csv
 import sys
 from datetime import datetime, timedelta
+
+import yaml
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
-import yaml
-# 데이터를 조회할 대상 고객 ID (하이픈 '-' 제외)
-# 이 ID가 google-ads.yaml의 login_customer_id와 다를 수 있습니다. (예: MCC로 하위 계정 조회)
-CUSTOMER_ID = "customer_id"
+
 
 def main(client, customer_id):
     """
-    지정된 고객 ID의 캠페인 데이터를 가져옵니다.
+    지정된 고객 ID의 캠페인 데이터를 가져와 CSV 파일로 저장합니다.
     """
     ga_service = client.get_service("GoogleAdsService")
 
@@ -18,13 +18,17 @@ def main(client, customer_id):
     start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
     
     # Google Ads 쿼리 언어 (GAQL)
-    # 지난 7일간의 캠페인별 이름, ID, 노출수, 클릭수 조회
+    # 요청한 모든 지표(spend, cpc, conversions 등)를 포함하도록 쿼리 수정
     query = f"""
         SELECT
             campaign.id,
             campaign.name,
             metrics.impressions,
-            metrics.clicks
+            metrics.clicks,
+            metrics.cost_micros,         -- 비용 (마이크로 단위)
+            metrics.average_cpc,         -- 평균 클릭당비용 (CPC)
+            metrics.conversions,         -- 전환수
+            metrics.cost_per_conversion  -- 전환당비용
         FROM
             campaign
         WHERE
@@ -36,22 +40,52 @@ def main(client, customer_id):
     """
 
     try:
-        # 검색 스트림을 사용하여 대용량 데이터 처리
-        stream = ga_service.search_stream(customer_id=customer_id, query=query)
+        # CSV 파일 준비
+        csv_filename = "google_ads_report.csv"
+        with open(csv_filename, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
 
-        print(f"--- Customer ID: {customer_id}의 캠페인 데이터 (지난 7일) ---")
-        
-        # 결과 반복 처리
-        for batch in stream:
-            for row in batch.results:
-                campaign = row.campaign
-                metrics = row.metrics
-                print(
-                    f"캠페인 ID: {campaign.id}, "
-                    f"이름: '{campaign.name}', "
-                    f"노출수: {metrics.impressions}, "
-                    f"클릭수: {metrics.clicks}"
-                )
+            # CSV 헤더(열 이름) 작성
+            header = [
+                "channel", "campaign name", "Impressions", "Clicks", 
+                "spend", "cpc", "conversions", "cost per conversion"
+            ]
+            writer.writerow(header)
+
+            print(f"--- Customer ID: {customer_id}의 캠페인 데이터 (지난 7일) ---")
+            print(f"'{csv_filename}' 파일에 저장 중...")
+
+            # 검색 스트림을 사용하여 대용량 데이터 처리
+            stream = ga_service.search_stream(customer_id=customer_id, query=query)
+
+            # 결과 반복 처리
+            for batch in stream:
+                for row in batch.results:
+                    campaign = row.campaign
+                    metrics = row.metrics
+
+                    # API에서 받은 비용(cost)과 CPC는 '마이크로' 단위(1/1,000,000)이므로
+                    # 실제 통화 단위로 변환하기 위해 1,000,000으로 나눕니다.
+                    spend = metrics.cost_micros / 1_000_000
+                    cpc = metrics.average_cpc / 1_000_000
+                    cost_per_conversion = metrics.cost_per_conversion / 1_000_000
+
+                    # CSV 파일에 쓸 데이터 행 생성
+                    data_row = [
+                        "google ads",
+                        campaign.name,
+                        metrics.impressions,
+                        metrics.clicks,
+                        f"{spend:.2f}",  # 소수점 2자리까지 표시
+                        f"{cpc:.2f}",
+                        metrics.conversions,
+                        f"{cost_per_conversion:.2f}"
+                    ]
+                    
+                    # CSV 파일에 한 줄 쓰기
+                    writer.writerow(data_row)
+            
+            print(f"\n성공적으로 '{csv_filename}' 파일을 저장했습니다.")
 
     except GoogleAdsException as ex:
         print(
@@ -67,15 +101,12 @@ def main(client, customer_id):
 if __name__ == "__main__":
     try:
         # google-ads.yaml 파일에서 인증 정보를 로드합니다.
-        # 현재 스크립트와 같은 디렉터리의 google-ads.yaml 파일을 사용합니다.
         googleads_client = GoogleAdsClient.load_from_storage(path="./google-ads.yaml")
 
         with open("google-ads.yaml", "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
 
         CUSTOMER_ID = config["customer_id"]
-
-
         main(googleads_client, CUSTOMER_ID)
 
     except FileNotFoundError:
