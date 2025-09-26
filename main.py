@@ -2,6 +2,7 @@ import functions_framework
 import logging
 import json
 import os
+import base64
 from datetime import datetime, timedelta
 from typing import Dict, Any
 import traceback
@@ -11,6 +12,13 @@ from google.cloud.exceptions import NotFound
 import google.generativeai as genai
 import requests
 from dotenv import load_dotenv
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # .env 파일 로드
 load_dotenv()
@@ -25,6 +33,66 @@ BIGQUERY_DATASET_ID = os.getenv('BIGQUERY_DATASET_ID', 'marketing_data')
 
 # Gemini API 설정
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', None)
+
+# Gmail API 스코프
+GMAIL_SCOPES = [
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'openid'
+]
+
+def authenticate_gmail():
+    """
+    Gmail API 인증을 수행합니다.
+    OAuth2를 사용하여 사용자 인증을 받습니다.
+    """
+    creds = None
+    
+    # token.json 파일이 있으면 기존 인증 정보 사용
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', GMAIL_SCOPES)
+    
+    # 유효한 인증 정보가 없으면 새로 인증
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            # credentials.json 파일이 필요합니다 (Google Cloud Console에서 다운로드)
+            if not os.path.exists('credentials.json'):
+                logger.error("credentials.json 파일이 없습니다. Google Cloud Console에서 OAuth 2.0 클라이언트 ID를 다운로드하세요.")
+                return None
+            
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', GMAIL_SCOPES)
+            creds = flow.run_local_server(port=8080)
+        
+        # 인증 정보를 token.json에 저장
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+    
+    return creds
+
+def create_gmail_message(sender, to, subject, message_text, html_content=None):
+    """
+    Gmail API용 메시지를 생성합니다.
+    """
+    message = MIMEMultipart('alternative')
+    message['to'] = to
+    message['from'] = sender
+    message['subject'] = subject
+    
+    # 텍스트 버전
+    text_part = MIMEText(message_text, 'plain', 'utf-8')
+    message.attach(text_part)
+    
+    # HTML 버전 (있는 경우)
+    if html_content:
+        html_part = MIMEText(html_content, 'html', 'utf-8')
+        message.attach(html_part)
+    
+    # Base64 인코딩
+    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+    return {'raw': raw_message}
 
 def create_bigquery_dataset_if_not_exists(client, dataset_id):
     """
@@ -437,39 +505,63 @@ def generate_report_content(analysis_results: Dict[str, Any]) -> str:
         # Returns an empty string if report generation fails
         return ""
 
-def send_email_via_mailgun(to_email: str, subject: str, html_content: str):
+def send_email_via_gmail(to_email: str, subject: str, html_content: str, message_text: str = None):
     """
-    Mailgun API를 사용해 이메일을 전송하는 함수.
-    API 키와 도메인은 환경 변수에서 가져옵니다.
+    Gmail API를 사용하여 이메일을 전송합니다.
     """
-    # 환경 변수에서 Mailgun API 키와 도메인을 가져옵니다.
-    api_key = os.environ.get('MAILGUN_API_KEY')
-    domain = os.environ.get('MAILGUN_DOMAIN')
-    
-    if not api_key or not domain:
-        logger.error("Mailgun API key or domain is not set in environment variables.")
-        raise ValueError("Mailgun credentials missing.")
-
-    logger.info(f"Sending email to {to_email}...")
-    
-    request_url = f'https://api.mailgun.net/v3/{domain}/messages'
-    
-    # Mailgun API에 보낼 데이터
-    data = {
-        'from': f'Automated Report <noreply@{domain}>',
-        'to': [to_email],
-        'subject': subject,
-        'html': html_content
-    }
-    
     try:
-        response = requests.post(request_url, auth=("api", api_key), data=data)
-        response.raise_for_status() # HTTP 오류가 발생하면 예외 발생
-        logger.info(f"Email sent successfully. Status: {response.status_code}")
-        return f"Email sent successfully to {to_email}"
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to send email via Mailgun: {e}")
-        # 이메일 전송 실패 시에도 파이프라인을 중단하지 않고 경고만 출력
+        # Gmail API 인증
+        creds = authenticate_gmail()
+        if not creds:
+            logger.error("Gmail API 인증 실패")
+            return f"Gmail API authentication failed"
+        
+        # Gmail API 서비스 빌드
+        service = build('gmail', 'v1', credentials=creds)
+        
+        # 발신자 이메일 (인증된 사용자의 이메일)
+        sender_email = creds.token_response.get('email') if hasattr(creds, 'token_response') else None
+        if not sender_email:
+            # 사용자 정보 가져오기
+            user_info = service.users().getProfile(userId='me').execute()
+            sender_email = user_info['emailAddress']
+        
+        logger.info(f"Gmail API로 이메일 전송 시도: {sender_email} -> {to_email}")
+        
+        # 텍스트 버전이 없으면 HTML에서 추출
+        if not message_text:
+            # 간단한 HTML 태그 제거
+            import re
+            message_text = re.sub(r'<[^>]+>', '', html_content)
+            message_text = re.sub(r'\s+', ' ', message_text).strip()
+        
+        # 메시지 생성
+        message = create_gmail_message(sender_email, to_email, subject, message_text, html_content)
+        
+        # 이메일 전송
+        sent_message = service.users().messages().send(
+            userId='me', 
+            body=message
+        ).execute()
+        
+        logger.info(f"이메일 전송 성공. 메시지 ID: {sent_message['id']}")
+        return f"Email sent successfully via Gmail API. Message ID: {sent_message['id']}"
+        
+    except HttpError as error:
+        logger.error(f"Gmail API 오류: {error}")
+        error_details = f"Gmail API error: {str(error)}"
+        
+        # 구체적인 오류 메시지 추가
+        if "access_denied" in str(error):
+            error_details += "\n\n해결 방법:\n1. Google Cloud Console에서 OAuth 동의 화면을 설정하세요\n2. 앱을 '테스트' 상태에서 '프로덕션' 상태로 변경하세요\n3. 또는 테스트 사용자로 자신의 이메일을 추가하세요"
+        elif "insufficient_authentication_scopes" in str(error):
+            error_details += "\n\n해결 방법:\n1. token.json 파일을 삭제하고 다시 인증하세요\n2. 더 넓은 스코프 권한이 필요할 수 있습니다"
+        elif "quotaExceeded" in str(error):
+            error_details += "\n\n해결 방법:\n1. Gmail API 할당량을 확인하세요\n2. 잠시 후 다시 시도하세요"
+            
+        return error_details
+    except Exception as e:
+        logger.error(f"이메일 전송 실패: {str(e)}")
         return f"Email sending failed: {str(e)}"
 
 def marketing_report_pipeline(report_date: str = None) -> Dict[str, Any]:
@@ -559,14 +651,20 @@ def marketing_report_pipeline(report_date: str = None) -> Dict[str, Any]:
             pipeline_results["report_generation"] = f"Report generation failed: {str(e)}"
         
         # 5. 이메일 전송 단계
-        logger.info("Step 5: Sending email report...")
+        logger.info("Step 5: Sending email report via Gmail API...")
         recipient_email = os.getenv('REPORT_RECIPIENT_EMAIL')
         if recipient_email and pipeline_results["report_generation"]:
             try:
-                email_result = send_email_via_mailgun(
+                # HTML 콘텐츠에서 텍스트 버전 생성
+                import re
+                text_content = re.sub(r'<[^>]+>', '', pipeline_results["report_generation"])
+                text_content = re.sub(r'\s+', ' ', text_content).strip()
+                
+                email_result = send_email_via_gmail(
                     to_email=recipient_email,
                     subject=f"Daily Marketing Report - {report_date}",
-                    html_content=pipeline_results["report_generation"]
+                    html_content=pipeline_results["report_generation"],
+                    message_text=text_content
                 )
                 pipeline_results["email_sending"] = email_result
                 logger.info(f"✓ Email sending completed: {email_result}")
