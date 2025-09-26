@@ -263,23 +263,5 @@ gcloud functions deploy marketing-pipeline \
 - Monitor BigQuery data quality
 - Verify email delivery status
 
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
-
-## 📄 License
-
-This project is distributed under the MIT License.
-
-## 📞 Support
-
-If you encounter issues or have questions, please create an issue.
-
----
-
 **Last Updated**: January 2024
 **Version**: 1.0.0
