@@ -53,8 +53,8 @@ def authenticate_gmail():
     if os.path.exists('token.json'):
         creds = Credentials.from_authorized_user_file('token.json', GMAIL_SCOPES)
     
-    # 유효한 인증 정보가 없으면 새로 인증
-    if not creds or not creds.valid:
+    # 유효한 인증 정보가 없거나 refresh_token이 없는 경우 새로 인증
+    if not creds or not creds.valid or not getattr(creds, 'refresh_token', None):
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
@@ -64,7 +64,12 @@ def authenticate_gmail():
                 return None
             
             flow = InstalledAppFlow.from_client_secrets_file('credentials.json', GMAIL_SCOPES)
-            creds = flow.run_local_server(port=8080)
+            # Force consent to ensure refresh_token issuance
+            creds = flow.run_local_server(
+                port=8080,
+                access_type='offline',
+                prompt='consent'
+            )
         
         # 인증 정보를 token.json에 저장
         with open('token.json', 'w') as token:
@@ -184,8 +189,8 @@ def analyze_marketing_data_with_gemini(data: pd.DataFrame, report_date: str) -> 
         # Gemini API 설정
         genai.configure(api_key=GEMINI_API_KEY)
         
-        # 모델 초기화 (무료 할당량이 있는 모델 사용)
-        model = genai.GenerativeModel('gemini-1.5-flash-8b')
+        # 모델 초기화 (지원되는 최신 모델 사용)
+        model = genai.GenerativeModel('models/gemini-2.5-flash')
         
         # 데이터를 문자열로 변환 (간단한 요약 형태로)
         if len(data) == 0:
@@ -440,6 +445,7 @@ def load_data_to_warehouse(data: Dict[str, Any], source_name: str, report_date: 
 def run_analysis_and_anomaly_detection(report_date: str) -> Dict[str, Any]:
     """
     웨어하우스 데이터를 기반으로 시계열 분석 및 이상치 탐지 실행 (Gemini LLM 사용)
+    메트릭 계산 및 캠페인별 데이터 생성 포함
     """
     try:
         logger.info(f"Running LLM-powered analysis for {report_date}...")
@@ -447,62 +453,229 @@ def run_analysis_and_anomaly_detection(report_date: str) -> Dict[str, Any]:
         # 1. BigQuery에서 데이터 조회
         df = get_bigquery_data_for_analysis(report_date)
         
-        # 2. Gemini로 마케팅 데이터 분석
+        # 2. 전체 메트릭 계산
+        if len(df) > 0:
+            total_cost = df['spend'].sum()
+            total_clicks = df['clicks'].sum()
+            total_conversions = df['conversions'].sum()
+            
+            # 평균 CPC 계산 (총 비용 / 총 클릭수)
+            avg_cpc = total_cost / total_clicks if total_clicks > 0 else 0
+            
+            # 평균 전환당 비용 계산 (총 비용 / 총 전환수)
+            avg_cost_per_conversion = total_cost / total_conversions if total_conversions > 0 else 0
+            
+            # ROA 계산 (임시로 conversions를 기반으로 계산, 실제로는 revenue 필요)
+            # ROA = (전환수 * 가정 전환가치) / 총비용
+            # 여기서는 N/A로 두거나, 간단히 conversions/spend 비율로 표시
+            roa = f"{(total_conversions / total_cost * 100):.2f}%" if total_cost > 0 else "N/A"
+            
+            # 포맷팅
+            metrics = {
+                "total_cost": f"${total_cost:,.2f}",
+                "cpc": f"${avg_cpc:.2f}",
+                "cpc_per_conversion": f"${avg_cost_per_conversion:.2f}",
+                "roa": roa
+            }
+            
+            # 3. 캠페인별 데이터를 HTML 테이블 행으로 생성
+            campaign_rows_html = ""
+            for _, row in df.iterrows():
+                # 각 캠페인의 메트릭 계산
+                campaign_cost = row['spend']
+                campaign_cpc = row['cpc']
+                campaign_clicks = row['clicks']
+                campaign_conversions = row['conversions']
+                campaign_cost_per_conv = row['cost_per_conversion']
+                
+                # 캠페인별 ROA 계산
+                campaign_roa = f"{(campaign_conversions / campaign_cost * 100):.2f}%" if campaign_cost > 0 else "N/A"
+                
+                campaign_rows_html += f"""
+                                    <tr>
+                                        <td>{row['channel']}</td>
+                                        <td>{row['campaign_name']}</td>
+                                        <td>${campaign_cost:,.2f}</td>
+                                        <td>${campaign_cpc:.2f}</td>
+                                        <td>${campaign_cost_per_conv:.2f}</td>
+                                        <td>{campaign_roa}</td>
+                                    </tr>"""
+        else:
+            # 데이터가 없는 경우 기본값
+            metrics = {
+                "total_cost": "N/A",
+                "cpc": "N/A",
+                "cpc_per_conversion": "N/A",
+                "roa": "N/A"
+            }
+            campaign_rows_html = """
+                                    <tr>
+                                        <td colspan="6" style="text-align: center; color: #64748b;">No campaign data available for this date</td>
+                                    </tr>"""
+        
+        # 4. Gemini로 마케팅 데이터 분석
         llm_analysis = analyze_marketing_data_with_gemini(df, report_date)
         
-        # 3. 결과 반환
+        # 5. 모든 결과 반환
         return {
             "status": "success", 
             "analysis_results": llm_analysis,
             "data_rows_analyzed": len(df),
-            "report_date": report_date
+            "report_date": report_date,
+            # 메트릭 추가
+            "total_cost": metrics["total_cost"],
+            "cpc": metrics["cpc"],
+            "cpc_per_conversion": metrics["cpc_per_conversion"],
+            "roa": metrics["roa"],
+            # 캠페인 행 HTML 추가
+            "campaign_rows": campaign_rows_html
         }
     except Exception as e:
         logger.error(f"Error running LLM analysis: {str(e)}")
         return {
             "status": "error",
             "error": str(e),
-            "analysis_results": f"Analysis failed: {str(e)}"
+            "analysis_results": f"Analysis failed: {str(e)}",
+            "total_cost": "N/A",
+            "cpc": "N/A",
+            "cpc_per_conversion": "N/A",
+            "roa": "N/A",
+            "campaign_rows": ""
         }
 
 def generate_report_content(analysis_results: Dict[str, Any]) -> str:
     """
     Generates HTML report content based on analysis results.
+    Applies the structure from `report_content_test.html`.
     """
     try:
         logger.info("Generating HTML report content...")
-        
-        report_date = analysis_results.get("report_date", "N/A")
+
+        # Extract values with safe defaults
+        report_date = analysis_results.get("report_date") or datetime.now().strftime("%Y-%m-%d")
         analysis_text = analysis_results.get("analysis_results", "No analysis results available.")
-        
-        # Here, we generate the HTML content for the report.
-        html_content = f"""
-        <html>
+
+        # Metrics may come top-level or under a 'metrics' key
+        metrics = analysis_results.get("metrics", {})
+        total_cost = analysis_results.get("total_cost", metrics.get("total_cost", "N/A"))
+        cpc = analysis_results.get("cpc", metrics.get("cpc", "N/A"))
+        cpc_per_conversion = analysis_results.get("cpc_per_conversion", metrics.get("cpc_per_conversion", "N/A"))
+        roa = analysis_results.get("roa", metrics.get("roa", "N/A"))
+
+        # Campaign rows should be pre-rendered HTML rows, otherwise leave empty
+        campaign_rows = analysis_results.get("campaign_rows", "")
+
+        # Generate the HTML content (escaped braces for f-string CSS)
+        html_content = f"""<!doctype html>
+<html lang=\"ko\">
         <head>
+            <meta charset=\"utf-8\">
+            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+            <title>Daily Marketing Data Analysis Report</title>
             <style>
-                body {{ font-family: sans-serif; line-height: 1.6; color: #333; }}
-                .container {{ max-width: 800px; margin: 0 auto; padding: 20px; }}
-                h1 {{ color: #005A9C; }}
-                pre {{ background: #f4f4f4; padding: 15px; border-radius: 5px; }}
+                /* Base */
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
+                       Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Apple Color Emoji', 'Segoe UI Emoji';
+                       line-height: 1.6; color: #222; background: #f7f9fb; margin: 0; }}
+                .container {{ max-width: 800px; margin: 0 auto; padding: 24px; }}
+                .card {{ background: #ffffff; border: 1px solid #e6ecf2; border-radius: 10px; box-shadow: 0 2px 8px rgba(16,24,40,0.06); overflow: hidden; }}
+                .section {{ padding: 20px 24px; }}
+                .header {{ background: linear-gradient(90deg, #005A9C 0%, #1a86d0 100%); color: #fff; }}
+                .header h1 {{ margin: 0 0 6px; font-size: 20px; }}
+                .muted {{ color: #6b7280; }}
+                .meta {{ display: flex; gap: 12px; flex-wrap: wrap; font-size: 13px; color: #3b82f6; }}
+                .meta strong {{ color: #e0f2fe; font-weight: 600; }}
+                h2 {{ font-size: 16px; margin: 0 0 10px; color: #0f172a; }}
+                p {{ margin: 0 0 12px; }}
+                hr {{ border: 0; height: 1px; background: #eef2f7; margin: 16px 0; }}
+
+                /* Preformatted analysis */
+                pre {{ background: #f4f6f8; color: inherit; padding: 16px; border-radius: 8px; border: 1px solid #e6ecf2;
+                      overflow: auto; white-space: pre-wrap; word-wrap: break-word; margin: 0; font-size: 13px;
+                      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; }}
+
+                /* Footer */
+                .footer {{ font-size: 12px; color: #64748b; text-align: center; padding: 16px 24px; }}
+
+                /* Email client safety */
+                a {{ color: #0ea5e9; text-decoration: none; }}
+                a:hover {{ text-decoration: underline; }}
+                /* KPI grid */
+                .kpis {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }}
+                @media (min-width: 560px) {{ .kpis {{ grid-template-columns: repeat(4, 1fr); }} }}
+                .kpi {{ border: 1px solid #eef2f7; border-radius: 8px; padding: 12px; background: #fafcff; }}
+                .kpi .label {{ font-size: 12px; color: #64748b; margin-bottom: 6px; }}
+                .kpi .value {{ font-size: 18px; font-weight: 700; color: #0f172a; }}
+                /* Table */
+                .table-wrap {{ overflow-x: auto; border: 1px solid #eef2f7; border-radius: 8px; }}
+                table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+                thead {{ background: #f1f5f9; }}
+                th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid #eef2f7; white-space: nowrap; }}
+                th {{ color: #334155; font-weight: 600; }}
+                tbody tr:hover {{ background: #f8fafc; }}
             </style>
         </head>
         <body>
-            <div class="container">
-                <h1>Daily Marketing Data Analysis Report</h1>
-                <p><strong>Report Date:</strong> {report_date}</p>
-                <hr>
-                <h2>Analysis Results</h2>
-                <pre>{analysis_text}</pre>
-                <p>This report was automatically generated using Google Cloud Functions and Gemini LLM.</p>
+            <div class=\"container\">
+                <div class=\"card\">
+                    <div class=\"section header\">
+                        <h1>Daily Marketing Data Analysis Report</h1>
+                        <div class=\"meta\">
+                            <div><strong>Report Date:</strong> <span>{report_date}</span></div>
+                        </div>
+                    </div>
+                    <div class=\"section\">
+                        <h2>Key Metrics</h2>
+                        <div class=\"kpis\">
+                            <div class=\"kpi\">
+                                <div class=\"label\">Total Cost</div>
+                                <div class=\"value\">{total_cost}</div>
+                            </div>
+                            <div class=\"kpi\">
+                                <div class=\"label\">CPC</div>
+                                <div class=\"value\">{cpc}</div>
+                            </div>
+                            <div class=\"kpi\">
+                                <div class=\"label\">CPC (Click per conversion)</div>
+                                <div class=\"value\">{cpc_per_conversion}</div>
+                            </div>
+                            <div class=\"kpi\">
+                                <div class=\"label\">ROA</div>
+                                <div class=\"value\">{roa}</div>
+                            </div>
+                        </div>
+                        <hr>
+                        <h2>Campaign Performance</h2>
+                        <div class=\"table-wrap\">
+                            <table role=\"table\" aria-label=\"Campaign performance\">
+                                <thead>
+                                    <tr>
+                                        <th scope=\"col\">Channel</th>
+                                        <th scope=\"col\">Campaign</th>
+                                        <th scope=\"col\">Total Cost</th>
+                                        <th scope=\"col\">CPC</th>
+                                        <th scope=\"col\">CPC (Click per conversion)</th>
+                                        <th scope=\"col\">ROA</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {campaign_rows}
+                                </tbody>
+                            </table>
+                        </div>
+                        <hr>
+                        <h2>LLM Analysis</h2>
+                        <pre>{analysis_text}</pre>
+                    </div>
+                    <div class=\"footer\">© {report_date} • Automated Report</div>
+                </div>
             </div>
         </body>
-        </html>
-        """
-        
+        </html>"""
+
         return html_content
     except Exception as e:
         logger.error(f"Error generating report: {str(e)}")
-        # Returns an empty string if report generation fails
         return ""
 
 def send_email_via_gmail(to_email: str, subject: str, html_content: str, message_text: str = None):
