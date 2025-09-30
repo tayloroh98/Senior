@@ -1,6 +1,6 @@
 # Marketing Data Pipeline
 
-An automated marketing data collection, analysis, and reporting pipeline. Integrates Google Ads API, BigQuery, Gemini LLM, and Mailgun to automatically generate and email daily marketing performance reports.
+An automated marketing data collection, analysis, and reporting pipeline. Integrates Google Ads API, BigQuery, and Gemini LLM to automatically generate daily marketing performance reports.
 
 ## 🚀 Key Features
 
@@ -8,7 +8,6 @@ An automated marketing data collection, analysis, and reporting pipeline. Integr
 - **Data Storage**: Data warehouse construction using BigQuery
 - **AI Analysis**: Marketing data analysis and insight generation using Gemini LLM
 - **Report Generation**: Automated daily reports in HTML format
-- **Email Delivery**: Automatic report delivery via Mailgun
 - **Cloud Deployment**: Serverless deployment via Google Cloud Functions
 
 ## 📋 System Requirements
@@ -17,7 +16,6 @@ An automated marketing data collection, analysis, and reporting pipeline. Integr
 - Google Cloud Platform account
 - Google Ads API access
 - Gemini API key
-- Mailgun account
 
 ## 🛠️ Installation and Setup
 
@@ -38,16 +36,6 @@ Create a `.env` file and configure the following variables:
 ```env
 # Gemini API Configuration
 GEMINI_API_KEY=your_gemini_api_key_here
-
-# Mailgun Configuration
-MAILGUN_API_KEY=your_mailgun_api_key_here
-MAILGUN_DOMAIN=your_mailgun_domain_here
-
-# Test Email Address
-TEST_EMAIL=your_test_email@example.com
-
-# Report Recipient Email
-REPORT_RECIPIENT_EMAIL=your_report_email@example.com
 
 # BigQuery Configuration (Optional)
 GCP_PROJECT_ID=marketing-automation-473220
@@ -79,14 +67,13 @@ export GOOGLE_APPLICATION_CREDENTIALS="path/to/service-account-key.json"
 ```
 marketing-data-pipeline/
 ├── main.py                 # Main pipeline code
-├── google_ads.py           # Google Ads API integration
-├── meta_ads.py            # Meta Ads API integration
-├── meta.py                # Meta utilities
 ├── google-ads.yaml        # Google Ads API configuration
-├── requirements.txt       # Python dependencies
-├── env_example.txt        # Environment variables example
-├── google_ads_report.csv  # Sample data
-└── README.md             # Project documentation
+├── credentials.json       # Gmail API credentials (if using email)
+├── token.json            # Gmail API token (auto-generated)
+├── requirements.txt      # Python dependencies
+├── .env                 # Environment variables
+├── .gitignore           # Git ignore file
+└── README.md           # Project documentation
 ```
 
 ## 🔧 Usage
@@ -94,10 +81,10 @@ marketing-data-pipeline/
 ### Local Testing
 ```bash
 # Run complete pipeline
-python -c "from main import marketing_report_pipeline; result = marketing_report_pipeline('2024-01-15'); print('Status:', result['status'])"
+python main.py
 
 # Run with specific date
-python -c "from main import marketing_report_pipeline; result = marketing_report_pipeline('2024-01-20'); print('Status:', result['status'])"
+python -c "from main import marketing_report_pipeline; result = marketing_report_pipeline('2024-01-15'); print('Status:', result['status'])"
 ```
 
 ### Cloud Functions Deployment
@@ -134,8 +121,7 @@ graph TD
     F --> G[Gemini LLM]
     G --> H[AI Analysis]
     H --> I[HTML Report Generation]
-    I --> J[Mailgun]
-    J --> K[Email Delivery]
+    I --> J[Console Output]
 ```
 
 ## 🔍 Key Functions
@@ -175,9 +161,6 @@ Analyzes data using Gemini LLM.
 ### `generate_report_content(analysis_results)`
 Generates HTML format report.
 
-### `send_email_via_mailgun(to_email, subject, html_content)`
-Sends email via Mailgun.
-
 ## 📈 Data Schema
 
 ### BigQuery Table: `google_ads_daily`
@@ -204,17 +187,16 @@ CREATE TABLE `project.dataset.google_ads_daily` (
 python -c "import os; from dotenv import load_dotenv; load_dotenv(); print('GEMINI_API_KEY:', 'Set' if os.getenv('GEMINI_API_KEY') else 'Not set')"
 
 # Test complete pipeline
-python -c "from main import marketing_report_pipeline; result = marketing_report_pipeline('2024-01-15'); print('Status:', result['status'], 'Duration:', result.get('pipeline_duration_seconds', 0), 'seconds')"
+python main.py
 ```
 
 ### Test Results Verification
 - Pipeline Status: `success`
-- Execution Time: ~6-8 seconds
+- Execution Time: ~30-35 seconds
 - Data Extraction: Campaign data collection from Google Ads
 - Data Storage: Data upload to BigQuery
 - AI Analysis: Insight generation via Gemini LLM
 - Report Generation: HTML format report creation
-- Email Delivery: Automatic delivery via Mailgun
 
 ## 🚨 Error Handling
 
@@ -223,7 +205,7 @@ The pipeline continues to the next step even if errors occur in each stage:
 - **Data Extraction Failure**: Continue analysis with existing data
 - **Data Storage Failure**: Continue with analysis
 - **AI Analysis Failure**: Generate basic report
-- **Email Delivery Failure**: Pipeline completes successfully
+- **Report Generation Failure**: Pipeline completes with error message
 
 ## 📝 Logging
 
@@ -235,12 +217,10 @@ INFO:main:✓ Google Ads data extraction completed: 3 rows
 INFO:main:Step 2: Loading data to warehouse...
 INFO:main:✓ Data loading completed: 3 rows uploaded
 INFO:main:Step 3: Running analysis and anomaly detection...
-INFO:main:✓ Analysis completed: 12 rows analyzed
+INFO:main:✓ Analysis completed: 3 rows analyzed
 INFO:main:Step 4: Generating report content...
-INFO:main:✓ Report generation completed: 1200 characters
-INFO:main:Step 5: Sending email report...
-INFO:main:✓ Email sending completed: Email sent successfully
-INFO:main:Marketing report pipeline completed in 8.28 seconds
+INFO:main:✓ Report generation completed: 8709 characters
+INFO:main:Marketing report pipeline completed in 33.43 seconds
 ```
 
 ## 🔒 Security Considerations
@@ -255,13 +235,22 @@ INFO:main:Marketing report pipeline completed in 8.28 seconds
 ### Cloud Functions Environment Variables Setup
 ```bash
 gcloud functions deploy marketing-pipeline \
-  --set-env-vars GEMINI_API_KEY=your_key,MAILGUN_API_KEY=your_key,MAILGUN_DOMAIN=your_domain,REPORT_RECIPIENT_EMAIL=your_email
+  --set-env-vars GEMINI_API_KEY=your_key,GCP_PROJECT_ID=your_project_id
 ```
 
 ### Monitoring
 - Check Cloud Functions logs
 - Monitor BigQuery data quality
-- Verify email delivery status
+- Verify pipeline execution status
 
-**Last Updated**: January 2024
-**Version**: 1.0.0
+## 📋 Dependencies
+
+Key Python packages required:
+- `google-ads` - Google Ads API client
+- `google-cloud-bigquery` - BigQuery client
+- `google-generativeai` - Gemini LLM client
+- `pandas` - Data manipulation
+- `python-dotenv` - Environment variable management
+
+**Last Updated**: January 2025
+**Version**: 2.0.0
