@@ -4,9 +4,12 @@ import json
 import os
 import base64
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, List
 import traceback
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import io
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 import google.generativeai as genai
@@ -259,9 +262,9 @@ def analyze_marketing_data_with_gemini(data: pd.DataFrame, report_date: str) -> 
         logger.error(f"Error analyzing marketing data with Gemini: {str(e)}")
         return f"LLM analysis failed: {str(e)}"
 
-def extract_google_ads_data(report_date: str) -> Dict[str, Any]:
+def extract_google_ads_data_7days(end_date: str = None) -> Dict[str, Any]:
     """
-    Google Ads API에서 데이터 추출 (어제 하루 데이터만)
+    Google Ads API에서 지난 7일간 데이터 추출 (요일별로 분리)
     """
     try:
         import pandas as pd
@@ -269,7 +272,13 @@ def extract_google_ads_data(report_date: str) -> Dict[str, Any]:
         from google.ads.googleads.client import GoogleAdsClient
         from google.ads.googleads.errors import GoogleAdsException
         
-        logger.info(f"Extracting Google Ads data for {report_date}...")
+        if not end_date:
+            end_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        # 7일 전 날짜 계산
+        start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=6)).strftime("%Y-%m-%d")
+        
+        logger.info(f"Extracting Google Ads data from {start_date} to {end_date}...")
         
         # Google Ads 클라이언트 초기화
         googleads_client = GoogleAdsClient.load_from_storage(path="./google-ads.yaml")
@@ -280,23 +289,26 @@ def extract_google_ads_data(report_date: str) -> Dict[str, Any]:
             config = yaml.safe_load(f)
         customer_id = config["customer_id"]
         
-        # Google Ads 쿼리 언어 (GAQL) - 어제 하루 데이터만
+        # Google Ads 쿼리 언어 (GAQL) - 7일간 데이터
         query = f"""
             SELECT
                 campaign.id,
                 campaign.name,
+                segments.date,
+                segments.day_of_week,
                 metrics.impressions,
                 metrics.clicks,
-                metrics.cost_micros,         -- 비용 (마이크로 단위)
-                metrics.average_cpc,         -- 평균 클릭당비용 (CPC)
-                metrics.conversions,         -- 전환수
-                metrics.cost_per_conversion  -- 전환당비용
+                metrics.cost_micros,
+                metrics.average_cpc,
+                metrics.conversions,
+                metrics.cost_per_conversion
             FROM
                 campaign
             WHERE
-                segments.date = '{report_date}'
+                segments.date BETWEEN '{start_date}' AND '{end_date}'
                 AND campaign.status = 'ENABLED'
             ORDER BY
+                segments.date DESC,
                 metrics.impressions DESC
         """
         
@@ -311,6 +323,7 @@ def extract_google_ads_data(report_date: str) -> Dict[str, Any]:
             for row in batch.results:
                 campaign = row.campaign
                 metrics = row.metrics
+                segments = row.segments
                 
                 # API에서 받은 비용(cost)과 CPC는 '마이크로' 단위이므로 실제 통화 단위로 변환
                 spend = metrics.cost_micros / 1_000_000
@@ -321,6 +334,8 @@ def extract_google_ads_data(report_date: str) -> Dict[str, Any]:
                 data_row = {
                     "channel": "google ads",
                     "campaign_name": campaign.name,
+                    "date": segments.date,
+                    "day_of_week": segments.day_of_week.name,
                     "impressions": metrics.impressions,
                     "clicks": metrics.clicks,
                     "spend": round(spend, 2),
@@ -333,13 +348,13 @@ def extract_google_ads_data(report_date: str) -> Dict[str, Any]:
         # pandas DataFrame으로 변환
         df = pd.DataFrame(data_rows)
         
-        logger.info(f"Successfully extracted {len(df)} rows of Google Ads data for {report_date}")
+        logger.info(f"Successfully extracted {len(df)} rows of Google Ads data for 7 days")
         
         return {
             "status": "success", 
             "data": df,
             "row_count": len(df),
-            "report_date": report_date
+            "date_range": f"{start_date} to {end_date}"
         }
         
     except GoogleAdsException as ex:
@@ -367,9 +382,12 @@ def extract_google_ads_data(report_date: str) -> Dict[str, Any]:
 #         raise
 
 
-def load_data_to_warehouse(data: Dict[str, Any], source_name: str, report_date: str = None) -> Dict[str, Any]:
+def load_data_to_warehouse_7days(data: Dict[str, Any], source_name: str, date_range: str = None) -> Dict[str, Any]:
+    """
+    Load 7-day data to BigQuery with duplicate prevention using MERGE operation
+    """
     try:
-        logger.info(f"Loading {source_name} data to BigQuery...")
+        logger.info(f"Loading {source_name} 7-day data to BigQuery...")
         
         # 입력 데이터에서 DataFrame 추출
         if "data" not in data:
@@ -378,6 +396,15 @@ def load_data_to_warehouse(data: Dict[str, Any], source_name: str, report_date: 
         df = data["data"]
         if not isinstance(df, pd.DataFrame):
             raise ValueError("Data must be a pandas DataFrame")
+        
+        if len(df) == 0:
+            logger.warning("No data to upload")
+            return {
+                "status": "success",
+                "source": source_name,
+                "rows_uploaded": 0,
+                "message": "No data to upload"
+            }
         
         # BigQuery 클라이언트 초기화
         client = bigquery.Client(project=BIGQUERY_PROJECT_ID)
@@ -389,57 +416,203 @@ def load_data_to_warehouse(data: Dict[str, Any], source_name: str, report_date: 
         # 테이블 이름 생성 (소스별로 다른 테이블)
         table_id = f"{source_name.lower().replace(' ', '_')}_daily"
         
-        # 테이블 스키마 정의
+        # 테이블 스키마 정의 (7일치 데이터용)
         schema = [
             bigquery.SchemaField("channel", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("campaign_name", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("date", "DATE", mode="REQUIRED"),
+            bigquery.SchemaField("day_of_week", "STRING", mode="NULLABLE"),
             bigquery.SchemaField("impressions", "INTEGER", mode="NULLABLE"),
             bigquery.SchemaField("clicks", "INTEGER", mode="NULLABLE"),
             bigquery.SchemaField("spend", "FLOAT", mode="NULLABLE"),
             bigquery.SchemaField("cpc", "FLOAT", mode="NULLABLE"),
             bigquery.SchemaField("conversions", "INTEGER", mode="NULLABLE"),
             bigquery.SchemaField("cost_per_conversion", "FLOAT", mode="NULLABLE"),
-            bigquery.SchemaField("report_date", "DATE", mode="REQUIRED"),
             bigquery.SchemaField("uploaded_at", "TIMESTAMP", mode="REQUIRED")
         ]
         
-        # 테이블 생성 (존재하지 않는 경우)
+        # 기존 테이블이 있다면 삭제하고 새로 생성 (스키마 충돌 방지)
+        try:
+            existing_table_ref = client.dataset(BIGQUERY_DATASET_ID).table(table_id)
+            client.delete_table(existing_table_ref)
+            logger.info(f"Deleted existing table {table_id} to prevent schema conflicts")
+        except Exception:
+            logger.info(f"Table {table_id} does not exist, will create new one")
+        
+        # 테이블 생성
         table = create_bigquery_table_if_not_exists(client, BIGQUERY_DATASET_ID, table_id, schema)
         
-        # DataFrame에 추가 컬럼 추가
+        # DataFrame 준비
         df_upload = df.copy()
-        if report_date:
-            df_upload['report_date'] = pd.to_datetime(report_date).date()
-        else:
-            df_upload['report_date'] = datetime.now().date()
+        
+        # date 컬럼이 문자열인 경우 DATE로 변환
+        if 'date' in df_upload.columns:
+            df_upload['date'] = pd.to_datetime(df_upload['date']).dt.date
+        
+        # 데이터 타입 변환 (BigQuery 호환성)
+        df_upload['impressions'] = df_upload['impressions'].fillna(0).astype(int)
+        df_upload['clicks'] = df_upload['clicks'].fillna(0).astype(int)
+        df_upload['conversions'] = df_upload['conversions'].fillna(0).astype(int)
+        
+        # uploaded_at 컬럼 추가
         df_upload['uploaded_at'] = datetime.now()
         
-        # BigQuery에 업로드
-        table_ref = client.dataset(BIGQUERY_DATASET_ID).table(table_id)
+        # 중복 데이터 제거를 위한 임시 테이블 생성
+        temp_table_id = f"{table_id}_temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        temp_table_ref = client.dataset(BIGQUERY_DATASET_ID).table(temp_table_id)
+        
+        # 임시 테이블에 데이터 업로드
         job_config = bigquery.LoadJobConfig(
             schema=schema,
-            write_disposition="WRITE_APPEND"
+            write_disposition="WRITE_TRUNCATE"
         )
         
-        job = client.load_table_from_dataframe(df_upload, table_ref, job_config=job_config)
+        logger.info(f"Uploading {len(df_upload)} rows to temporary table {temp_table_id}")
+        job = client.load_table_from_dataframe(df_upload, temp_table_ref, job_config=job_config)
         job.result()  # 작업 완료 대기
         
-        logger.info(f"Successfully uploaded {len(df_upload)} rows to {BIGQUERY_DATASET_ID}.{table_id}")
+        # MERGE 쿼리를 사용하여 중복 데이터 제거 및 업데이트
+        merge_query = f"""
+        MERGE `{BIGQUERY_PROJECT_ID}.{BIGQUERY_DATASET_ID}.{table_id}` AS target
+        USING `{BIGQUERY_PROJECT_ID}.{BIGQUERY_DATASET_ID}.{temp_table_id}` AS source
+        ON target.channel = source.channel 
+           AND target.campaign_name = source.campaign_name 
+           AND target.date = source.date
+        WHEN MATCHED THEN
+          UPDATE SET
+            day_of_week = source.day_of_week,
+            impressions = source.impressions,
+            clicks = source.clicks,
+            spend = source.spend,
+            cpc = source.cpc,
+            conversions = source.conversions,
+            cost_per_conversion = source.cost_per_conversion,
+            uploaded_at = source.uploaded_at
+        WHEN NOT MATCHED THEN
+          INSERT (channel, campaign_name, date, day_of_week, impressions, clicks, spend, cpc, conversions, cost_per_conversion, uploaded_at)
+          VALUES (source.channel, source.campaign_name, source.date, source.day_of_week, source.impressions, source.clicks, source.spend, source.cpc, source.conversions, source.cost_per_conversion, source.uploaded_at)
+        """
+        
+        logger.info("Executing MERGE query to prevent duplicates...")
+        query_job = client.query(merge_query)
+        query_job.result()  # 작업 완료 대기
+        
+        # 임시 테이블 삭제
+        client.delete_table(temp_table_ref)
+        logger.info(f"Deleted temporary table {temp_table_id}")
+        
+        logger.info(f"Successfully uploaded {len(df_upload)} rows to {BIGQUERY_DATASET_ID}.{table_id} with duplicate prevention")
         
         return {
             "status": "success",
             "source": source_name,
             "rows_uploaded": len(df_upload),
             "table_id": f"{BIGQUERY_PROJECT_ID}.{BIGQUERY_DATASET_ID}.{table_id}",
-            "write_disposition": "WRITE_APPEND"
+            "write_disposition": "MERGE",
+            "date_range": date_range
         }
         
     except Exception as e:
         logger.error(f"Error loading {source_name} data to BigQuery: {str(e)}")
+        # 임시 테이블이 있다면 삭제
+        try:
+            if 'temp_table_ref' in locals():
+                client.delete_table(temp_table_ref)
+        except:
+            pass
         return {
             "status": "error",
             "source": source_name,
             "error": str(e)
+        }
+
+def run_weekly_analysis_and_reporting(google_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run weekly analysis with charts and insights for 7-day data
+    """
+    try:
+        logger.info("Running weekly analysis and reporting...")
+        
+        if google_data.get("status") != "success":
+            return {
+                "status": "error",
+                "error": "No valid data available for analysis"
+            }
+        
+        df = google_data["data"]
+        date_range = google_data.get("date_range", "N/A")
+        
+        if len(df) == 0:
+            return {
+                "status": "success",
+                "daily_summary": [],
+                "chart_base64": "",
+                "insights": {'warnings': [], 'positive_insights': []},
+                "date_range": date_range,
+                "data_rows_analyzed": 0
+            }
+        
+        # Create daily summary from DataFrame
+        daily_summary = []
+        weekday_names = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY']
+        weekday_korean = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        
+        # Group by date and calculate daily totals
+        daily_data = df.groupby('date').agg({
+            'impressions': 'sum',
+            'clicks': 'sum',
+            'spend': 'sum',
+            'conversions': 'sum',
+            'day_of_week': 'first'
+        }).reset_index()
+        
+        for _, row in daily_data.iterrows():
+            avg_cpc = row['spend'] / row['clicks'] if row['clicks'] > 0 else 0
+            day_name = weekday_korean[weekday_names.index(row['day_of_week'])] if row['day_of_week'] in weekday_names else row['day_of_week']
+            
+            # Handle date formatting safely
+            if hasattr(row['date'], 'strftime'):
+                date_str = row['date'].strftime('%Y-%m-%d')
+            else:
+                date_str = str(row['date'])
+            
+            daily_summary.append({
+                'date': date_str,
+                'day_of_week': day_name,
+                'total_impressions': int(row['impressions']),
+                'total_clicks': int(row['clicks']),
+                'total_spend': round(row['spend'], 2),
+                'total_conversions': int(row['conversions']),
+                'avg_cpc': round(avg_cpc, 2)
+            })
+        
+        # Sort by date
+        daily_summary.sort(key=lambda x: x['date'])
+        
+        # Generate chart
+        chart_base64 = create_spend_clicks_chart(daily_summary)
+        
+        # Analyze insights
+        insights = analyze_performance_insights(daily_summary, df)
+        
+        return {
+            "status": "success",
+            "daily_summary": daily_summary,
+            "chart_base64": chart_base64,
+            "insights": insights,
+            "date_range": date_range,
+            "data_rows_analyzed": len(df)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error running weekly analysis: {str(e)}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "daily_summary": [],
+            "chart_base64": "",
+            "insights": {'warnings': [], 'positive_insights': []},
+            "data_rows_analyzed": 0
         }
 
 def run_analysis_and_anomaly_detection(report_date: str) -> Dict[str, Any]:
@@ -543,137 +716,495 @@ def run_analysis_and_anomaly_detection(report_date: str) -> Dict[str, Any]:
             "campaign_rows": ""
         }
 
-def generate_report_content(analysis_results: Dict[str, Any]) -> str:
+def create_spend_clicks_chart(daily_summary: List[Dict]) -> str:
     """
-    Generates HTML report content based on analysis results.
-    Applies the structure from `report_content_test.html`.
+    Create smooth combined chart for daily spend and clicks
     """
     try:
-        logger.info("Generating HTML report content...")
+        if not daily_summary:
+            return ""
+        
+        # Prepare data
+        dates = [datetime.strptime(item['date'], '%Y-%m-%d') for item in daily_summary]
+        spend_data = [item['total_spend'] for item in daily_summary]
+        clicks_data = [item['total_clicks'] for item in daily_summary]
+        
+        # Create figure with single subplot
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+        
+        # Plot spend data with smooth line
+        color1 = '#1f77b4'
+        ax1.set_xlabel('Date', fontsize=12)
+        ax1.set_ylabel('Daily Spend ($)', color=color1, fontsize=12)
+        line1 = ax1.plot(dates, spend_data, color=color1, linewidth=3, marker='o', markersize=8, 
+                       markerfacecolor='white', markeredgewidth=2, markeredgecolor=color1, 
+                       linestyle='-', alpha=0.8, label='Daily Spend')
+        
+        # Smooth the line using interpolation
+        try:
+            from scipy.interpolate import make_interp_spline
+            import numpy as np
+            
+            # Convert dates to numeric values for interpolation
+            date_nums = mdates.date2num(dates)
+            x_smooth = np.linspace(date_nums.min(), date_nums.max(), 100)
+            
+            # Create smooth spline for spend data
+            spend_smooth = make_interp_spline(date_nums, spend_data, k=3)
+            spend_smooth_values = spend_smooth(x_smooth)
+            
+            # Plot smooth line
+            ax1.plot(mdates.num2date(x_smooth), spend_smooth_values, color=color1, 
+                    linewidth=2, alpha=0.6, linestyle='--')
+            
+            # Create smooth spline for clicks data
+            clicks_smooth = make_interp_spline(date_nums, clicks_data, k=3)
+            clicks_smooth_values = clicks_smooth(x_smooth)
+            
+            # Plot smooth line for clicks
+            ax2 = ax1.twinx()
+            color2 = '#ff7f0e'
+            ax2.set_ylabel('Daily Clicks', color=color2, fontsize=12)
+            line2 = ax2.plot(dates, clicks_data, color=color2, linewidth=3, marker='s', markersize=8,
+                           markerfacecolor='white', markeredgewidth=2, markeredgecolor=color2,
+                           linestyle='-', alpha=0.8, label='Daily Clicks')
+            
+            ax2.plot(mdates.num2date(x_smooth), clicks_smooth_values, color=color2,
+                    linewidth=2, alpha=0.6, linestyle='--')
+            
+            ax2.tick_params(axis='y', labelcolor=color2)
+            
+        except ImportError:
+            # Fallback if scipy is not available
+            ax2 = ax1.twinx()
+            color2 = '#ff7f0e'
+            ax2.set_ylabel('Daily Clicks', color=color2, fontsize=12)
+            ax2.plot(dates, clicks_data, color=color2, linewidth=3, marker='s', markersize=8)
+            ax2.tick_params(axis='y', labelcolor=color2)
+        
+        ax1.tick_params(axis='y', labelcolor=color1)
+        ax1.grid(True, alpha=0.3)
+        
+        # Format x-axis
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+        ax1.xaxis.set_major_locator(mdates.DayLocator())
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+        
+        # Add title
+        plt.title('7-Day Performance Overview', fontsize=16, fontweight='bold', pad=20)
+        
+        # Add legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', framealpha=0.9)
+        
+        plt.tight_layout()
+        
+        # Encode image to base64
+        img_buffer = io.BytesIO()
+        plt.savefig(img_buffer, format='png', dpi=300, bbox_inches='tight', 
+                   facecolor='white', edgecolor='none')
+        img_buffer.seek(0)
+        img_base64 = base64.b64encode(img_buffer.getvalue()).decode()
+        plt.close()
+        
+        return f"data:image/png;base64,{img_base64}"
+        
+    except Exception as e:
+        logger.error(f"Error creating chart: {str(e)}")
+        return ""
 
-        # Extract values with safe defaults
-        report_date = analysis_results.get("report_date") or datetime.now().strftime("%Y-%m-%d")
-        analysis_text = analysis_results.get("analysis_results", "No analysis results available.")
+def analyze_performance_insights(daily_summary: List[Dict], df: pd.DataFrame) -> Dict[str, List[str]]:
+    """
+    Analyze performance data to generate priority-based alerts
+    """
+    try:
+        insights = {
+            'warnings': [],
+            'positive_insights': []
+        }
+        
+        if not daily_summary:
+            return insights
+        
+        # Calculate 7-day totals
+        total_spend = sum(item['total_spend'] for item in daily_summary)
+        total_clicks = sum(item['total_clicks'] for item in daily_summary)
+        total_conversions = sum(item['total_conversions'] for item in daily_summary)
+        avg_daily_spend = total_spend / len(daily_summary)
+        avg_cpc = total_spend / total_clicks if total_clicks > 0 else 0
+        conversion_rate = (total_conversions / total_clicks) * 100 if total_clicks > 0 else 0
+        
+        # 1. Warning alerts (urgent issues)
+        # Sudden cost spike detection
+        max_spend = max(item['total_spend'] for item in daily_summary)
+        if max_spend > avg_daily_spend * 1.5:
+            insights['warnings'].append(f"⚠️ Cost spike detected: ${max_spend:.2f} ({((max_spend/avg_daily_spend-1)*100):.1f}% above average)")
+        
+        # Click drop detection
+        avg_daily_clicks = total_clicks / len(daily_summary)
+        min_clicks = min(item['total_clicks'] for item in daily_summary)
+        if min_clicks < avg_daily_clicks * 0.5:
+            insights['warnings'].append(f"⚠️ Click drop detected: {min_clicks} clicks ({((min_clicks/avg_daily_clicks-1)*100):.1f}% below average)")
+        
+        # Poor performance alerts
+        if conversion_rate < 2.0:  # Low conversion rate
+            insights['warnings'].append(f"⚠️ Low conversion rate: {conversion_rate:.2f}% (industry average: 2-5%)")
+        
+        if avg_cpc > 2.0:  # High CPC
+            insights['warnings'].append(f"⚠️ High CPC: ${avg_cpc:.2f} (consider optimizing keywords)")
+        
+        # 2. Positive insights
+        # Best performing day
+        best_spend_day = max(daily_summary, key=lambda x: x['total_spend'])
+        insights['positive_insights'].append(f"🎯 Best spending day: {best_spend_day['day_of_week']} (${best_spend_day['total_spend']:.2f})")
+        
+        # Best click day
+        best_clicks_day = max(daily_summary, key=lambda x: x['total_clicks'])
+        insights['positive_insights'].append(f"📈 Highest click day: {best_clicks_day['day_of_week']} ({best_clicks_day['total_clicks']} clicks)")
+        
+        # Good conversion rate
+        if conversion_rate >= 3.0:
+            insights['positive_insights'].append(f"✅ Strong conversion rate: {conversion_rate:.2f}% (above industry average)")
+        
+        # Efficient CPC
+        if avg_cpc <= 1.0:
+            insights['positive_insights'].append(f"✅ Efficient CPC: ${avg_cpc:.2f} (cost-effective)")
+        
+        # Weekly trend analysis
+        if len(daily_summary) >= 2:
+            first_half_spend = sum(item['total_spend'] for item in daily_summary[:3])
+            second_half_spend = sum(item['total_spend'] for item in daily_summary[3:])
+            if second_half_spend > first_half_spend * 1.1:
+                insights['positive_insights'].append("📊 Positive trend: Increased spending in second half of week")
+            elif abs(second_half_spend - first_half_spend) / first_half_spend < 0.1:
+                insights['positive_insights'].append("📊 Consistent performance: Stable spending throughout the week")
+        
+        # Best performing campaign
+        if df is not None and len(df) > 0:
+            efficient_campaigns = df[df['conversions'] > 0].nsmallest(1, 'cost_per_conversion')
+            if len(efficient_campaigns) > 0:
+                best_campaign = efficient_campaigns.iloc[0]
+                insights['positive_insights'].append(f"🏆 Top performing campaign: {best_campaign['campaign_name']} (${best_campaign['cost_per_conversion']:.2f} per conversion)")
+        
+        return insights
+        
+    except Exception as e:
+        logger.error(f"Error analyzing performance insights: {str(e)}")
+        return {'warnings': [], 'positive_insights': []}
 
-        # Metrics may come top-level or under a 'metrics' key
-        metrics = analysis_results.get("metrics", {})
-        total_cost = analysis_results.get("total_cost", metrics.get("total_cost", "N/A"))
-        cpc = analysis_results.get("cpc", metrics.get("cpc", "N/A"))
-        cpc_per_conversion = analysis_results.get("cpc_per_conversion", metrics.get("cpc_per_conversion", "N/A"))
-        roa = analysis_results.get("roa", metrics.get("roa", "N/A"))
-
-        # Campaign rows should be pre-rendered HTML rows, otherwise leave empty
-        campaign_rows = analysis_results.get("campaign_rows", "")
-
-        # Generate the HTML content (escaped braces for f-string CSS)
+def generate_report_content(analysis_results: Dict[str, Any]) -> str:
+    """
+    Generate new HTML report content with weekly summary cards, charts, and insights
+    """
+    try:
+        logger.info("Generating new HTML report content...")
+        
+        # Extract data from analysis results
+        daily_summary = analysis_results.get("daily_summary", [])
+        chart_base64 = analysis_results.get("chart_base64", "")
+        insights = analysis_results.get("insights", {'warnings': [], 'positive_insights': []})
+        date_range = analysis_results.get("date_range", "N/A")
+        
+        # Calculate weekly totals for summary cards
+        total_spend = sum(item['total_spend'] for item in daily_summary)
+        total_clicks = sum(item['total_clicks'] for item in daily_summary)
+        total_conversions = sum(item['total_conversions'] for item in daily_summary)
+        avg_cpc = total_spend / total_clicks if total_clicks > 0 else 0
+        
+        # Daily table rows
+        daily_table_rows = ""
+        for day_data in daily_summary:
+            daily_table_rows += f"""
+                <tr>
+                    <td>{day_data['day_of_week']}</td>
+                    <td>{day_data['date']}</td>
+                    <td>${day_data['total_spend']:.2f}</td>
+                    <td>{day_data['total_clicks']}</td>
+                    <td>{day_data['total_conversions']}</td>
+                    <td>${day_data['avg_cpc']:.2f}</td>
+                </tr>
+            """
+        
+        # Warning alerts section
+        warnings_section = ""
+        if insights['warnings']:
+            warning_items = "".join([f"<li>{item}</li>" for item in insights['warnings']])
+            warnings_section = f"""
+                <div class="alert alert-warning">
+                    <h3>⚠️ Performance Alerts</h3>
+                    <ul>{warning_items}</ul>
+                </div>
+            """
+        
+        # Positive insights section
+        positive_section = ""
+        if insights['positive_insights']:
+            positive_items = "".join([f"<li>{item}</li>" for item in insights['positive_insights']])
+            positive_section = f"""
+                <div class="alert alert-success">
+                    <h3>✅ Positive Highlights</h3>
+                    <ul>{positive_items}</ul>
+                </div>
+            """
+        
+        # Chart section
+        chart_section = ""
+        if chart_base64:
+            chart_section = f"""
+                <div class="chart-section">
+                    <h3>📊 7-Day Performance Overview</h3>
+                    <img src="{chart_base64}" alt="7-day performance chart" style="max-width: 100%; height: auto;">
+                </div>
+            """
+        
         html_content = f"""<!doctype html>
-<html lang=\"ko\">
-        <head>
-            <meta charset=\"utf-8\">
-            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-            <title>Daily Marketing Data Analysis Report</title>
-            <style>
-                /* Base */
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
-                       Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Apple Color Emoji', 'Segoe UI Emoji';
-                       line-height: 1.6; color: #222; background: #f7f9fb; margin: 0; }}
-                .container {{ max-width: 800px; margin: 0 auto; padding: 24px; }}
-                .card {{ background: #ffffff; border: 1px solid #e6ecf2; border-radius: 10px; box-shadow: 0 2px 8px rgba(16,24,40,0.06); overflow: hidden; }}
-                .section {{ padding: 20px 24px; }}
-                .header {{ background: linear-gradient(90deg, #005A9C 0%, #1a86d0 100%); color: #fff; }}
-                .header h1 {{ margin: 0 0 6px; font-size: 20px; }}
-                .muted {{ color: #6b7280; }}
-                .meta {{ display: flex; gap: 12px; flex-wrap: wrap; font-size: 13px; color: #3b82f6; }}
-                .meta strong {{ color: #e0f2fe; font-weight: 600; }}
-                h2 {{ font-size: 16px; margin: 0 0 10px; color: #0f172a; }}
-                p {{ margin: 0 0 12px; }}
-                hr {{ border: 0; height: 1px; background: #eef2f7; margin: 16px 0; }}
-
-                /* Preformatted analysis */
-                pre {{ background: #f4f6f8; color: inherit; padding: 16px; border-radius: 8px; border: 1px solid #e6ecf2;
-                      overflow: auto; white-space: pre-wrap; word-wrap: break-word; margin: 0; font-size: 13px;
-                      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; }}
-
-                /* Footer */
-                .footer {{ font-size: 12px; color: #64748b; text-align: center; padding: 16px 24px; }}
-
-                /* Email client safety */
-                a {{ color: #0ea5e9; text-decoration: none; }}
-                a:hover {{ text-decoration: underline; }}
-                /* KPI grid */
-                .kpis {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }}
-                @media (min-width: 560px) {{ .kpis {{ grid-template-columns: repeat(4, 1fr); }} }}
-                .kpi {{ border: 1px solid #eef2f7; border-radius: 8px; padding: 12px; background: #fafcff; }}
-                .kpi .label {{ font-size: 12px; color: #64748b; margin-bottom: 6px; }}
-                .kpi .value {{ font-size: 18px; font-weight: 700; color: #0f172a; }}
-                /* Table */
-                .table-wrap {{ overflow-x: auto; border: 1px solid #eef2f7; border-radius: 8px; }}
-                table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-                thead {{ background: #f1f5f9; }}
-                th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid #eef2f7; white-space: nowrap; }}
-                th {{ color: #334155; font-weight: 600; }}
-                tbody tr:hover {{ background: #f8fafc; }}
-            </style>
-        </head>
-        <body>
-            <div class=\"container\">
-                <div class=\"card\">
-                    <div class=\"section header\">
-                        <h1>Daily Marketing Data Analysis Report</h1>
-                        <div class=\"meta\">
-                            <div><strong>Report Date:</strong> <span>{report_date}</span></div>
-                        </div>
-                    </div>
-                    <div class=\"section\">
-                        <h2>Key Metrics</h2>
-                        <div class=\"kpis\">
-                            <div class=\"kpi\">
-                                <div class=\"label\">Total Cost</div>
-                                <div class=\"value\">{total_cost}</div>
-                            </div>
-                            <div class=\"kpi\">
-                                <div class=\"label\">CPC</div>
-                                <div class=\"value\">{cpc}</div>
-                            </div>
-                            <div class=\"kpi\">
-                                <div class=\"label\">CPC (Click per conversion)</div>
-                                <div class=\"value\">{cpc_per_conversion}</div>
-                            </div>
-                            <div class=\"kpi\">
-                                <div class=\"label\">ROA</div>
-                                <div class=\"value\">{roa}</div>
-                            </div>
-                        </div>
-                        <hr>
-                        <h2>Campaign Performance</h2>
-                        <div class=\"table-wrap\">
-                            <table role=\"table\" aria-label=\"Campaign performance\">
-                                <thead>
-                                    <tr>
-                                        <th scope=\"col\">Channel</th>
-                                        <th scope=\"col\">Campaign</th>
-                                        <th scope=\"col\">Total Cost</th>
-                                        <th scope=\"col\">CPC</th>
-                                        <th scope=\"col\">CPC (Click per conversion)</th>
-                                        <th scope=\"col\">ROA</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {campaign_rows}
-                                </tbody>
-                            </table>
-                        </div>
-                        <hr>
-                        <h2>LLM Analysis</h2>
-                        <pre>{analysis_text}</pre>
-                    </div>
-                    <div class=\"footer\">© {report_date} • Automated Report</div>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Weekly Marketing Performance Report</title>
+    <style>
+        /* Base */
+        body {{ 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
+                       Ubuntu, Cantarell, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6; 
+            color: #222; 
+            background: #f7f9fb; 
+            margin: 0; 
+        }}
+        .container {{ 
+            max-width: 1000px; 
+            margin: 0 auto; 
+            padding: 24px; 
+        }}
+        .card {{ 
+            background: #ffffff; 
+            border: 1px solid #e6ecf2; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 12px rgba(16,24,40,0.08); 
+            overflow: hidden; 
+            margin-bottom: 20px;
+        }}
+        .section {{ 
+            padding: 24px; 
+        }}
+        .header {{ 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            color: #fff; 
+            text-align: center;
+        }}
+        .header h1 {{ 
+            margin: 0 0 8px; 
+            font-size: 28px; 
+            font-weight: 700;
+        }}
+        .meta {{ 
+            font-size: 14px; 
+            color: #e0f2fe; 
+            opacity: 0.9;
+        }}
+        
+        /* Summary Cards */
+        .summary-cards {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin: 24px 0;
+        }}
+        .summary-card {{
+            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+            border: 1px solid #cbd5e1;
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }}
+        .summary-card h3 {{
+            margin: 0 0 8px;
+            font-size: 14px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 600;
+        }}
+        .summary-card .value {{
+            font-size: 32px;
+            font-weight: 700;
+            color: #1e293b;
+            margin: 0;
+        }}
+        
+        h2 {{ 
+            font-size: 20px; 
+            margin: 0 0 16px; 
+            color: #0f172a; 
+            border-bottom: 2px solid #e2e8f0;
+            padding-bottom: 8px;
+        }}
+        h3 {{
+            font-size: 16px;
+            margin: 0 0 12px;
+            color: #334155;
+        }}
+        
+        /* Alerts */
+        .alert {{
+            border-radius: 12px;
+            padding: 20px;
+            margin: 20px 0;
+            border-left: 4px solid;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }}
+        .alert-warning {{
+            background-color: #fef3c7;
+            border-left-color: #f59e0b;
+            border: 1px solid #fbbf24;
+        }}
+        .alert-success {{
+            background-color: #d1fae5;
+            border-left-color: #10b981;
+            border: 1px solid #34d399;
+        }}
+        .alert ul {{
+            margin: 12px 0;
+            padding-left: 20px;
+        }}
+        .alert li {{
+            margin: 6px 0;
+            font-size: 14px;
+        }}
+        
+        /* Table */
+        .table-wrap {{ 
+            overflow-x: auto; 
+            border: 1px solid #eef2f7; 
+            border-radius: 12px; 
+            margin: 20px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }}
+        table {{ 
+            width: 100%; 
+            border-collapse: collapse; 
+            font-size: 14px; 
+        }}
+        thead {{ 
+            background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%); 
+        }}
+        th, td {{ 
+            padding: 16px 12px; 
+            text-align: left; 
+            border-bottom: 1px solid #eef2f7; 
+        }}
+        th {{ 
+            color: #334155; 
+            font-weight: 600; 
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        tbody tr:hover {{ 
+            background: #f8fafc; 
+        }}
+        
+        /* Chart */
+        .chart-section {{
+            text-align: center;
+            margin: 24px 0;
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 20px;
+        }}
+        .chart-section img {{
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            max-width: 100%;
+            height: auto;
+        }}
+        
+        /* Footer */
+        .footer {{ 
+            font-size: 12px; 
+            color: #64748b; 
+            text-align: center; 
+            padding: 20px 24px; 
+            background: #f8fafc;
+            border-top: 1px solid #e2e8f0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div class="section header">
+                <h1>Weekly Marketing Performance Report</h1>
+                <div class="meta">
+                    Report Period: {date_range} | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
                 </div>
             </div>
-        </body>
-        </html>"""
-
+            
+            <div class="section">
+                <!-- Summary Cards -->
+                <div class="summary-cards">
+                    <div class="summary-card">
+                        <h3>Total Spend</h3>
+                        <p class="value">${total_spend:.2f}</p>
+                    </div>
+                    <div class="summary-card">
+                        <h3>Total Clicks</h3>
+                        <p class="value">{total_clicks:,}</p>
+                    </div>
+                    <div class="summary-card">
+                        <h3>Total Conversions</h3>
+                        <p class="value">{total_conversions}</p>
+                    </div>
+                    <div class="summary-card">
+                        <h3>Average CPC</h3>
+                        <p class="value">${avg_cpc:.2f}</p>
+                    </div>
+                </div>
+                
+                <!-- Warning Alerts -->
+                {warnings_section}
+                
+                <!-- Performance Chart -->
+                {chart_section}
+                
+                <!-- Daily Performance Table -->
+                <h2>📅 Daily Performance Summary</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Day</th>
+                                <th>Date</th>
+                                <th>Spend</th>
+                                <th>Clicks</th>
+                                <th>Conversions</th>
+                                <th>Avg CPC</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {daily_table_rows}
+                        </tbody>
+                    </table>
+                </div>
+                
+                <!-- Positive Insights -->
+                {positive_section}
+            </div>
+            
+            <div class="footer">
+                © {datetime.now().strftime('%Y-%m-%d')} • Automated Weekly Report
+            </div>
+        </div>
+    </div>
+</body>
+</html>"""
+        
         return html_content
+        
     except Exception as e:
         logger.error(f"Error generating report: {str(e)}")
         return ""
@@ -759,17 +1290,17 @@ def marketing_report_pipeline(report_date: str = None) -> Dict[str, Any]:
             "email_sending": ""
         }
         
-        # 1. 데이터 추출 단계
-        logger.info("Step 1: Extracting Google Ads data...")
+        # 1. 데이터 추출 단계 (7일치 데이터)
+        logger.info("Step 1: Extracting Google Ads 7-day data...")
         try:
-            google_data = extract_google_ads_data(report_date)
+            google_data = extract_google_ads_data_7days(report_date)
             pipeline_results["data_extraction"] = {
                 "status": "success",
                 "source": "Google Ads",
                 "rows_extracted": google_data.get("row_count", 0),
-                "report_date": google_data.get("report_date", report_date)
+                "date_range": google_data.get("date_range", "N/A")
             }
-            logger.info(f"✓ Google Ads data extraction completed: {google_data.get('row_count', 0)} rows")
+            logger.info(f"✓ Google Ads 7-day data extraction completed: {google_data.get('row_count', 0)} rows")
         except Exception as e:
             logger.error(f"✗ Google Ads data extraction failed: {str(e)}")
             pipeline_results["data_extraction"] = {
@@ -779,15 +1310,15 @@ def marketing_report_pipeline(report_date: str = None) -> Dict[str, Any]:
             }
             # 데이터 추출 실패 시에도 분석은 계속 진행 (기존 데이터 사용)
         
-        # 2. 데이터 적재 단계
-        logger.info("Step 2: Loading data to warehouse...")
+        # 2. 데이터 적재 단계 (중복 방지)
+        logger.info("Step 2: Loading 7-day data to warehouse with duplicate prevention...")
         load_results = []
         if pipeline_results["data_extraction"].get("status") == "success":
             try:
-                load_result = load_data_to_warehouse(google_data, "Google Ads", report_date)
+                load_result = load_data_to_warehouse_7days(google_data, "Google Ads", google_data.get("date_range"))
                 load_results.append(load_result)
                 pipeline_results["data_loading"] = load_results
-                logger.info(f"✓ Data loading completed: {load_result.get('rows_uploaded', 0)} rows uploaded")
+                logger.info(f"✓ Data loading completed: {load_result.get('rows_uploaded', 0)} rows uploaded with MERGE")
             except Exception as e:
                 logger.error(f"✗ Data loading failed: {str(e)}")
                 pipeline_results["data_loading"] = [{
@@ -799,12 +1330,12 @@ def marketing_report_pipeline(report_date: str = None) -> Dict[str, Any]:
             logger.warning("Skipping data loading due to extraction failure")
             pipeline_results["data_loading"] = [{"status": "skipped", "reason": "extraction_failed"}]
         
-        # 3. 분석 실행 단계
-        logger.info("Step 3: Running analysis and anomaly detection...")
+        # 3. 분석 실행 단계 (새로운 형식)
+        logger.info("Step 3: Running 7-day analysis with charts and insights...")
         try:
-            analysis_results = run_analysis_and_anomaly_detection(report_date)
+            analysis_results = run_weekly_analysis_and_reporting(google_data)
             pipeline_results["analysis"] = analysis_results
-            logger.info(f"✓ Analysis completed: {analysis_results.get('data_rows_analyzed', 0)} rows analyzed")
+            logger.info(f"✓ Weekly analysis completed: {analysis_results.get('data_rows_analyzed', 0)} rows analyzed")
         except Exception as e:
             logger.error(f"✗ Analysis failed: {str(e)}")
             pipeline_results["analysis"] = {
