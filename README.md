@@ -121,7 +121,7 @@ graph TD
     F --> G[Gemini LLM]
     G --> H[AI Analysis]
     H --> I[HTML Report Generation]
-    I --> J[Console Output]
+    I --> J[Email Sent]
 ```
 
 ## 🔍 Key Functions
