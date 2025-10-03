@@ -252,5 +252,5 @@ Key Python packages required:
 - `pandas` - Data manipulation
 - `python-dotenv` - Environment variable management
 
-**Last Updated**: January 2025
+**Last Updated**: September 2025
 **Version**: 2.0.0
